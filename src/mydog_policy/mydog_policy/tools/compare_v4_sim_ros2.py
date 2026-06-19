@@ -103,6 +103,14 @@ def ros_leg_matrix(rows: list[dict], prefix: str) -> np.ndarray:
     return np.stack([col(rows, f"{prefix}_{ln}") for ln in POLICY_LEG_ORDER], axis=1)
 
 
+def ros_joint_prefix(fields: list[str], *candidates: str) -> str:
+    """从多个候选前缀里挑第一个在 ros CSV 中存在的 (兼容 *_sim 与旧 *_policy)。"""
+    for c in candidates:
+        if f"{c}_FR_hip" in fields:
+            return c
+    return candidates[0]
+
+
 # ----------------------------------------------------------------------------
 # 统计
 # ----------------------------------------------------------------------------
@@ -210,9 +218,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---- 收集对比项 ----
     stats = []
 
-    # q_ref / q_cmd_final (核心验收)
-    s_qref = diff_stats("q_ref", ros_joint_matrix(r_sel, "q_ref_policy"), golden_joint_matrix(g_sel, "q_ref"))
-    s_qcmd = diff_stats("q_cmd_final", ros_joint_matrix(r_sel, "q_cmd_final_policy"),
+    # q_ref / q_cmd_final (核心验收): ros 用 sim_semantic 空间列 (*_sim)，golden 用 q_ref / q_cmd_final
+    p_qref = ros_joint_prefix(r_fields, "q_ref_sim", "q_ref_policy")
+    p_qcmd = ros_joint_prefix(r_fields, "q_cmd_final_sim", "q_cmd_final_policy")
+    s_qref = diff_stats("q_ref(sim)", ros_joint_matrix(r_sel, p_qref), golden_joint_matrix(g_sel, "q_ref"))
+    s_qcmd = diff_stats("q_cmd_final(sim)", ros_joint_matrix(r_sel, p_qcmd),
                         golden_joint_matrix(g_sel, "q_cmd_final"))
     stats.append(s_qref)
     stats.append(s_qcmd)

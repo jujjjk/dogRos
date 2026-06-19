@@ -81,6 +81,8 @@ SIM_V4_DEFAULT_JOINT_POS_POLICY = np.array(
     ],
     dtype=np.float64,
 )
+# 显式别名：core 内部统一使用 sim_semantic 空间。
+SIM_V4_DEFAULT_JOINT_POS_SIM = SIM_V4_DEFAULT_JOINT_POS_POLICY
 
 # JointSemanticMapper.default_joint_angle 的站姿 (mapper default)，仅用于对比报警。
 MAPPER_DEFAULT_JOINT_POS_POLICY = np.array(
@@ -296,10 +298,11 @@ class CoreInputs:
     lin_vel: tuple = (0.0, 0.0, 0.0)       # body linear velocity m/s (一般真机不可用)
     imu_valid: bool = False
 
-    # 电机反馈 (policy order, absolute angle)
-    q_actual_policy: Optional[np.ndarray] = None   # (12,) rad
-    dq_actual_policy: Optional[np.ndarray] = None
-    tau_actual_policy: Optional[np.ndarray] = None
+    # 电机反馈 (sim_semantic 空间, absolute angle)。
+    # 由 ROS2 wrapper 用 SimRealSemanticBridge.real_policy_to_sim(...) 转换后传入。
+    q_actual_sim: Optional[np.ndarray] = None   # (12,) rad
+    dq_actual_sim: Optional[np.ndarray] = None
+    tau_sim: Optional[np.ndarray] = None
     feedback_valid: bool = False
 
     # base height (一般真机不可用 -> None)
@@ -602,18 +605,18 @@ class FanfanV4MigrationCore:
             "phase_to_switch": phase_to_switch,
             "phase_switch_guard_active": guard_strength > 1.0e-6,
             "phase_switch_guard_strength": guard_strength,
-            # reference / output
-            "q_cpg_policy": q_cpg.copy(),
-            "q_ref_policy": q_ref.copy(),
-            "q_vmc_delta_policy": q_vmc_delta.copy(),
-            "q_cmd_raw_policy": q_cmd_raw.copy(),
-            "q_cmd_final_policy": q_cmd_final.copy(),
-            "q_actual_policy": q_actual.copy(),
-            "q_error_policy": (q_cmd_final - q_actual).copy(),
-            "q_ref_cmd_diff": (q_ref - q_cmd_final).copy(),
+            # reference / output (sim_semantic 空间)
+            "q_cpg_sim": q_cpg.copy(),
+            "q_ref_sim": q_ref.copy(),
+            "q_vmc_delta_sim": q_vmc_delta.copy(),
+            "q_cmd_raw_sim": q_cmd_raw.copy(),
+            "q_cmd_final_sim": q_cmd_final.copy(),
+            "q_actual_sim": q_actual.copy(),
+            "q_error_sim": (q_cmd_final - q_actual).copy(),
+            "q_ref_cmd_diff_sim": (q_ref - q_cmd_final).copy(),
             # gains
-            "kp_policy": kp.copy(),
-            "kd_policy": kd.copy(),
+            "kp_sim": kp.copy(),
+            "kd_sim": kd.copy(),
             # FK / clearance
             "fk_clearance_ref": fk_clearance_ref.copy(),
             "fk_clearance_cmd": fk_clearance_cmd.copy(),
@@ -625,13 +628,13 @@ class FanfanV4MigrationCore:
         debug.update(gains_dbg)
         debug.update(out["debug"])
         return {
-            "q_cpg_policy": q_cpg,
-            "q_ref_policy": q_ref,
-            "q_vmc_delta_policy": q_vmc_delta,
-            "q_cmd_raw_policy": q_cmd_raw,
-            "q_cmd_final_policy": q_cmd_final,
-            "kp_policy": kp,
-            "kd_policy": kd,
+            "q_cpg_sim": q_cpg,
+            "q_ref_sim": q_ref,
+            "q_vmc_delta_sim": q_vmc_delta,
+            "q_cmd_raw_sim": q_cmd_raw,
+            "q_cmd_final_sim": q_cmd_final,
+            "kp_sim": kp,
+            "kd_sim": kd,
             "debug_info": debug,
         }
 
@@ -861,9 +864,9 @@ class FanfanV4MigrationCore:
                 early_contact_score = forces.copy()
                 contact_guard = in_window & (forces > cfg.rear_early_contact_force_threshold)
                 early_contact_source = "force"
-            elif inp.feedback_valid and inp.q_actual_policy is not None:
+            elif inp.feedback_valid and inp.q_actual_sim is not None:
                 # 替代：摆动腿 q_error 太大说明脚提前踩到东西被顶住
-                q_actual = np.asarray(inp.q_actual_policy, dtype=np.float64).reshape(12)
+                q_actual = np.asarray(inp.q_actual_sim, dtype=np.float64).reshape(12)
                 # 用上一步命令与实际之差近似 (calf 关节)
                 q_err = np.abs(self._q_last_cmd - q_actual)
                 leg_err = np.maximum.reduce([q_err[0::3], q_err[1::3], q_err[2::3]])
@@ -995,10 +998,10 @@ class FanfanV4MigrationCore:
         cfg = self.cfg
         dt = cfg.dt
 
-        # --- 当前关节位置 (q_current) 替代规则 ---
+        # --- 当前关节位置 (q_current, sim_semantic) 替代规则 ---
         use_virtual = (not inp.feedback_valid) or inp.dry_run_virtual_feedback
-        if inp.feedback_valid and inp.q_actual_policy is not None and not inp.dry_run_virtual_feedback:
-            q_actual = np.asarray(inp.q_actual_policy, dtype=np.float64).reshape(12)
+        if inp.feedback_valid and inp.q_actual_sim is not None and not inp.dry_run_virtual_feedback:
+            q_actual = np.asarray(inp.q_actual_sim, dtype=np.float64).reshape(12)
         else:
             # dry-run: 假设电机完美跟随上一周期命令
             q_actual = self._q_last_cmd.copy()
@@ -1162,8 +1165,8 @@ def _self_test():
     print(f"[migration_core] max fk_clearance_ref per leg (FR,FL,RR,RL) = {max_clearance}")
     print(f"[migration_core] front swing height cfg = {core.cfg.fast_trot_front_swing_height_m}, "
           f"rear = {core.cfg.fast_trot_rear_swing_height_m}")
-    print(f"[migration_core] last q_ref_policy = {out['q_ref_policy']}")
-    print(f"[migration_core] last kp = {out['kp_policy']}")
+    print(f"[migration_core] last q_ref_sim = {out['q_ref_sim']}")
+    print(f"[migration_core] last kp = {out['kp_sim']}")
 
 
 if __name__ == "__main__":

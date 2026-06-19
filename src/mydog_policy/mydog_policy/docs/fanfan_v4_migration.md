@@ -13,11 +13,43 @@
 
 | 文件 | 作用 |
 |---|---|
-| `mydog_policy/fanfan_v4_migration_core.py` | 纯 Python(numpy) 迁移核心，不依赖 ROS2/rclpy/HTTP/Jetson。把仿真 V4 的 FK/IK、phase、swing/stance、Light VMC、yaw damping、rear guard、rate limiter、torque soft backoff 逐项迁移 |
-| `mydog_policy/fanfan_cpg_vmc_v4_migration_node.py` | ROS2 外壳，只做参数/IMU/反馈/发送/CSV/安全，不重新写 gait |
-| `mydog_policy/tools/compare_v4_sim_ros2.py` | 把 golden CSV 与 ROS2 dry-run CSV 按 `relative_time` 对齐并输出差异统计 |
+| `mydog_policy/fanfan_v4_migration_core.py` | 纯 Python(numpy) 迁移核心，**只在 sim_semantic 空间工作**。FK/IK、phase、swing/stance、Light VMC、yaw damping、rear guard、rate limiter、torque soft backoff 逐项迁移 |
+| `mydog_policy/sim_real_semantic_bridge.py` | sim_semantic ↔ real_policy 语义桥（推导自 mapper + IsaacLab 语义）|
+| `mydog_policy/fanfan_cpg_vmc_v4_migration_node.py` | ROS2 外壳，负责三空间转换 + IMU/反馈/发送/CSV/安全，不重新写 gait |
+| `mydog_policy/tools/compare_v4_sim_ros2.py` | 把 golden CSV 与 ROS2 dry-run CSV 按 `relative_time` 对齐（**sim_semantic 空间**）并输出差异统计 |
 | `mydog_policy/docs/fanfan_v4_migration.md` | 本文档 |
 | `setup.py` | 已含 `fanfan_cpg_vmc_v4_migration_node` console script，无需改动 |
+
+## 0.1 三个 joint 空间（必须分清楚）
+
+| 空间 | 定义 | 谁用 |
+|---|---|---|
+| **sim_semantic** | IsaacLab / golden CSV 的空间（`q_ref_0~11` / `q_cmd_final_0~11`），policy 顺序 FR,FL,RR,RL，符号全 +1，零点 0 | V4 core 内部 + sim_compare |
+| **real_policy** | `JointSemanticMapper.real_to_policy_abs_q_dq()` 返回的空间，policy 顺序但符号/零点由真机 mapper 定义 | ROS2 wrapper 中转 |
+| **real_motor** | 真正发给电机 0x11~0x43 的空间，`mapper.policy_target_to_real_target()` | HTTP 发送 |
+
+**桥的推导（不是猜）**：IsaacLab 部署契约 `q_real_motor = real_sign_isaac ⊙ q_sim`；mapper `q_real_policy = mapper.joint_sign ⊙ q_real_ordered`。代入得
+`sign = mapper.joint_sign · real_sign_isaac`，`offset = mapper.joint_sign ⊙ (real_zero_isaac − mapper.real_zero)`。
+当前仓库 `mapper.joint_sign == real_sign_isaac` 且零点均为 0，所以
+**桥 = 恒等（sign=+1, offset=0, index=identity, roundtrip_error=0）**，即 sim_semantic ≡ real_policy。
+桥仍保留显式 sign/offset/index 并在启动打印 + 自检，日后 mapper 改符号/零点会自动跟随。
+
+> 结论：既然桥在当前语义下是恒等，`q_ref` 的 sim↔real_policy **不是空间问题**。
+> 若 `q_ref_abs_diff_max` 仍大，应查 phase / warmup / support preload（下一轮，本轮不动 gait）。
+
+## 0.2 数据链路
+
+```
+电机反馈 → mapper.real_to_policy_abs_q_dq → real_policy
+        → bridge.real_policy_to_sim       → sim_semantic → core.step
+core.step → q_cmd_final_sim
+        → bridge.sim_to_real_policy        → real_policy
+        → mapper.policy_target_to_real_target → real_motor → HTTP
+sim_compare: core q_ref_sim / q_cmd_final_sim  ⟷  golden q_ref_* / q_cmd_final_*  (都在 sim_semantic)
+```
+
+core 的公开输入/输出变量名已改清楚：`q_actual_sim / q_cmd_final_sim / q_ref_sim / kp_sim / kd_sim ...`，
+core 内部**不再调用** `JointSemanticMapper`。
 
 迁移核心严格对应的 IsaacLab 源码：
 
@@ -114,15 +146,22 @@ real ↔ policy 映射沿用 `semantic_mapper.JointSemanticMapper`：
   `apply_default_pose_offsets=False`，不再叠加 offset）。
 - **mapper default**：`JointSemanticMapper.default_joint_angle` 后腿仍是 0.2269 / -0.3491。
 
-两者 `default_policy_diff_max ≈ 0.4363 rad`（后腿 calf 差），**远大于 0.05 rad**。
-因此 `stand_source=sim_v4` 时节点会打印 WARNING：
+**默认站姿对比必须在 real_policy 空间做**（跨空间直接比没有意义）：
+
+```
+default_real_policy_diff = bridge.sim_to_real_policy(sim_v4_default_sim) - mapper_default_real_policy
+```
+
+当前桥是恒等，所以该差异 ≈ `0.4363 rad`（后腿 calf 差），**远大于 0.05 rad**。
+因此 `stand_source=sim_v4` 时节点打印 WARNING：
 
 ```
 真机必须先 stand_only 进入 sim_v4 default，不能直接从 mapper default 进入 gait。
 ```
 
-CSV 记录 `stand_source`、`sim_v4_default_policy_*`、`mapper_default_policy_*`、
-`default_policy_diff_*`、`default_policy_diff_max`。
+CSV 记录 `sim_v4_default_sim_*`、`sim_v4_default_real_policy_*`、`mapper_default_real_policy_*`、
+`default_real_policy_diff_*`、`default_real_policy_diff_max`，
+以及 `bridge_enabled`、`bridge_roundtrip_error_max`、`sim_to_real_index_*`、`sim_to_real_sign_*`、`sim_to_real_offset_*`。
 
 ---
 
