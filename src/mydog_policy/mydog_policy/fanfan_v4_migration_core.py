@@ -600,7 +600,11 @@ class FanfanV4MigrationCore:
             "preload_gate": preload_gate.copy(),
             "support_preload_gate": support_preload_gate.copy(),
             "early_stance_gate": early_stance_gate.copy(),
+            "support_gate": np.maximum(
+                (~swing_mask).astype(np.float64), np.maximum(touchdown_blend, early_stance_gate)
+            ),
             "support_preload_delta_z": support_preload.copy(),
+            "global_support_height_offset_m": float(cfg.fast_trot_global_support_height_offset_m),
             # phase switch guard
             "phase_to_switch": phase_to_switch,
             "phase_switch_guard_active": guard_strength > 1.0e-6,
@@ -998,13 +1002,21 @@ class FanfanV4MigrationCore:
         cfg = self.cfg
         dt = cfg.dt
 
-        # --- 当前关节位置 (q_current, sim_semantic) 替代规则 ---
+        # --- 当前关节位置 q_current / 速度 qd_current (sim_semantic) 替代规则 ---
+        # sim 中 q_current = robot.data.joint_pos, qd_current = robot.data.joint_vel。
+        # torque backoff = kp*(q_target-q_current) - kd*qd_current，两项都要复刻。
         use_virtual = (not inp.feedback_valid) or inp.dry_run_virtual_feedback
+        q_last_cmd_prev = self._q_last_cmd.copy()
         if inp.feedback_valid and inp.q_actual_sim is not None and not inp.dry_run_virtual_feedback:
             q_actual = np.asarray(inp.q_actual_sim, dtype=np.float64).reshape(12)
+            if inp.dq_actual_sim is not None:
+                qd_current = np.asarray(inp.dq_actual_sim, dtype=np.float64).reshape(12)
+            else:
+                qd_current = np.zeros(12)
         else:
-            # dry-run: 假设电机完美跟随上一周期命令
+            # dry-run: 假设电机完美跟随上一周期命令, 速度项取 0 (与 sim 静止初值一致)
             q_actual = self._q_last_cmd.copy()
+            qd_current = np.zeros(12)
         q_current = q_actual
 
         kp_eff = np.clip(kp, 1.0e-6, None)
@@ -1013,7 +1025,7 @@ class FanfanV4MigrationCore:
         if not cfg.enable_deploy_target_filter:
             self._q_last_cmd = q_raw.copy()
             self._qdot_last_cmd = np.zeros(12)
-            tau = self._pd_torque(q_raw, q_current, kp_eff, kd_eff)
+            tau = self._pd_torque(q_raw, q_current, qd_current, kp_eff, kd_eff)
             return {
                 "q_cmd_final": q_raw.copy(),
                 "q_actual": q_actual,
@@ -1022,6 +1034,9 @@ class FanfanV4MigrationCore:
                     "rate_limited_delta": np.zeros(12),
                     "rate_clip_ratio": 0.0,
                     "torque_clip_ratio": 0.0,
+                    "q_last_cmd_sim": q_last_cmd_prev,
+                    "q_rate_limited_sim": q_raw.copy(),
+                    "q_torque_filtered_sim": q_raw.copy(),
                 },
             }
 
@@ -1063,7 +1078,7 @@ class FanfanV4MigrationCore:
                 else 0.0
             )
             q_after_torque = self._soft_output_torque_target(
-                q_after_accel, q_current, kp_eff, kd_eff,
+                q_after_accel, q_current, qd_current, kp_eff, kd_eff,
                 guard_strength=guard_strength,
                 early_contact_guard_strength=early_contact_guard_strength,
             )
@@ -1078,7 +1093,7 @@ class FanfanV4MigrationCore:
 
         # action delay disabled
         q_final = q_after_torque
-        tau = self._pd_torque(q_final, q_current, kp_eff, kd_eff)
+        tau = self._pd_torque(q_final, q_current, qd_current, kp_eff, kd_eff)
 
         return {
             "q_cmd_final": q_final.copy(),
@@ -1088,13 +1103,16 @@ class FanfanV4MigrationCore:
                 "rate_limited_delta": rate_limited_delta.copy(),
                 "rate_clip_ratio": rate_clip_ratio,
                 "torque_clip_ratio": torque_clip_ratio,
+                "q_last_cmd_sim": q_last_cmd_prev,
+                "q_rate_limited_sim": q_after_rate.copy(),
+                "q_torque_filtered_sim": q_after_torque.copy(),
             },
         }
 
-    def _soft_output_torque_target(self, q_target, q_current, kp_eff, kd_eff, *, guard_strength, early_contact_guard_strength):
+    def _soft_output_torque_target(self, q_target, q_current, qd_current, kp_eff, kd_eff, *, guard_strength, early_contact_guard_strength):
         cfg = self.cfg
-        # qd_current = 0 (在 sim 中是 joint_vel, dry-run 近似为 0)
-        tau = kp_eff * (q_target - q_current)
+        # tau = kp*(q_target-q_current) - kd*qd_current (与 sim _pd_torque_for 一致)
+        tau = kp_eff * (q_target - q_current) - kd_eff * qd_current
         abs_tau = np.abs(tau)
         soft_start = np.full(12, cfg.fast_trot_soft_output_start_torque)
         soft_full = np.full(12, cfg.fast_trot_soft_output_full_torque)
@@ -1118,9 +1136,9 @@ class FanfanV4MigrationCore:
         return q_current + scale * (q_target - q_current)
 
     @staticmethod
-    def _pd_torque(q_target, q_current, kp_eff, kd_eff):
-        # dq_current 近似为 0 (真机/虚拟反馈速度项忽略, 与 sim 一致地只用位置误差估计峰值)
-        return kp_eff * (q_target - q_current)
+    def _pd_torque(q_target, q_current, qd_current, kp_eff, kd_eff):
+        # tau = kp*(q_target-q_current) - kd*qd_current (与 sim _pd_torque_for 一致)
+        return kp_eff * (q_target - q_current) - kd_eff * np.asarray(qd_current, dtype=np.float64).reshape(12)
 
     @staticmethod
     def _joint_type_vector(hip, thigh, calf):

@@ -121,6 +121,7 @@ class FanfanV4MigrationNode(Node):
         self._target_yaw = 0.0
 
         self.golden = None
+        self._prev_golden_q_actual = None
         if self.test_mode == "sim_compare" or self.sim_compare_csv_path:
             self._load_golden_csv()
 
@@ -385,8 +386,13 @@ class FanfanV4MigrationNode(Node):
             self._run_stand_only(now, rel_wall, dt, imu, feedback, fb_sim)
             return
 
+        rel_core_expected = self.core.step_index * self.dt
         if self.soft_stop_active:
             core_out = self._soft_stop_step(now)
+        elif self.golden is not None and self.test_mode == "sim_compare":
+            # sim_compare: 用 golden 的 base 状态 / q_actual / dq / foot force 喂 core，
+            # 验证“相同输入下迁移数学是否等价”，不改 gait。
+            core_out = self._core_step_golden(rel_core_expected)
         else:
             core_out = self._core_step(imu, feedback, fb_sim)
         debug = core_out["debug_info"]
@@ -434,6 +440,68 @@ class FanfanV4MigrationNode(Node):
             test_mode=self.test_mode,
             dry_run_virtual_feedback=self.dry_run_virtual_feedback,
             vmc_scale=vmc_scale,
+        )
+        return self.core.step(inp)
+
+    @staticmethod
+    def _gf(row: dict, key: str, default: float = 0.0) -> float:
+        v = row.get(key)
+        if v in (None, ""):
+            return default
+        try:
+            return float(v)
+        except ValueError:
+            return default
+
+    def _core_step_golden(self, rel: float) -> dict:
+        """sim_compare: 用 golden 的 base 状态/q_actual/dq/foot force 喂 core。
+
+        off-by-one: sim 在 step t 用的 q_current / base 是“上一步物理后”的状态 (= golden row t-1)，
+        而 core 这一步要对齐 golden row t。所以 INPUT 取 rel-dt 处的 golden 行，输出再对齐 rel 处。
+        """
+        rows = self.golden["rows"]
+        times = self.golden["times"]
+        input_rel = rel - self.dt
+        if input_rel < 0.0:
+            # 第一步: warmup=0 -> VMC=0; q_current=default
+            q_current = self.sim_v4_default_sim.copy()
+            dq = np.zeros(12)
+            base_height = self.core.cfg.light_vmc_target_base_height
+            roll = pitch = yaw = 0.0
+            gyro = (0.0, 0.0, 0.0)
+            lin_vel = (0.0, 0.0, 0.0)
+            foot_force = np.zeros(4)
+        else:
+            idx = int(np.nanargmin(np.abs(times - input_rel)))
+            grow = rows[idx]
+            q_current = self._golden_vec(grow, "q_actual")
+            if np.any(~np.isfinite(q_current)):
+                q_current = self.sim_v4_default_sim.copy()
+            if idx >= 1:
+                q_prev = self._golden_vec(rows[idx - 1], "q_actual")
+                dq = (q_current - q_prev) / self.dt
+                if np.any(~np.isfinite(dq)):
+                    dq = np.zeros(12)
+            else:
+                dq = np.zeros(12)
+            base_height = self._gf(grow, "base_height", self.core.cfg.light_vmc_target_base_height)
+            roll = self._gf(grow, "base_roll", self._gf(grow, "roll"))
+            pitch = self._gf(grow, "base_pitch", self._gf(grow, "pitch"))
+            yaw = self._gf(grow, "base_yaw", self._gf(grow, "yaw"))
+            gyro = (self._gf(grow, "base_ang_vel_x"), self._gf(grow, "base_ang_vel_y"), self._gf(grow, "base_ang_vel_z"))
+            lin_vel = (self._gf(grow, "base_lin_vel_x"), self._gf(grow, "base_lin_vel_y"), self._gf(grow, "base_lin_vel_z"))
+            foot_force = np.array([self._gf(grow, f"foot_normal_force_{i}") for i in range(4)], dtype=np.float64)
+
+        inp = CoreInputs(
+            roll=roll, pitch=pitch, yaw=yaw,
+            gyro=gyro, lin_vel=lin_vel, imu_valid=True,
+            q_actual_sim=q_current, dq_actual_sim=dq, tau_sim=None,
+            feedback_valid=True,
+            base_height_m=base_height,
+            foot_force=foot_force,
+            test_mode="sim_compare",
+            dry_run_virtual_feedback=False,   # 用 golden 的真实状态做 backoff
+            vmc_scale=1.0,
         )
         return self.core.step(inp)
 
@@ -502,6 +570,9 @@ class FanfanV4MigrationNode(Node):
             "tau_est": z12.copy(), "rate_limited_delta": z12.copy(),
             "rate_clip_ratio": 0.0, "torque_clip_ratio": 0.0, "support_preload_delta_z": z4.copy(),
             "support_preload_gate": z4.copy(), "preload_gate": z4.copy(), "early_stance_gate": z4.copy(),
+            "support_gate": np.ones(4), "global_support_height_offset_m": 0.0,
+            "q_last_cmd_sim": q_sim.copy(), "q_rate_limited_sim": q_sim.copy(),
+            "q_torque_filtered_sim": q_sim.copy(),
             "frequency": 0.0, "stride": 0.0, "swing_height": 0.0, "node_state": node_state,
         }
 
@@ -737,8 +808,9 @@ class FanfanV4MigrationNode(Node):
 
         q_ref_sim = np.asarray(debug["q_ref_sim"], dtype=np.float64)
         q_cmd_final_sim = np.asarray(debug["q_cmd_final_sim"], dtype=np.float64)
-        q_actual_sim = np.asarray(safety["q_actual_sim"], dtype=np.float64)
-        q_error_sim = np.asarray(safety["q_error_sim"], dtype=np.float64)
+        # q_actual_sim / q_error_sim 用 core 实际使用的值 (sim_compare 下 = golden q_actual)
+        q_actual_sim = np.asarray(debug["q_actual_sim"], dtype=np.float64)
+        q_error_sim = np.asarray(debug["q_error_sim"], dtype=np.float64)
 
         # real_policy 空间 (经 bridge 转换)
         q_ref_real_policy = self.bridge.sim_to_real_policy(q_ref_sim)
@@ -763,6 +835,26 @@ class FanfanV4MigrationNode(Node):
         vec_leg("swing_progress", debug["swing_progress"])
         vec_leg("swing_mask", np.asarray(debug["swing_mask"], dtype=np.float64))
         vec_leg("support_mask", np.asarray(debug["support_mask"], dtype=np.float64))
+        s("phase_switch_guard_active", int(bool(debug["phase_switch_guard_active"])))
+        s("phase_switch_guard_strength", debug["phase_switch_guard_strength"])
+
+        # --- support/stance foot z 细节 (issue 1: 对齐 support 阶段 foot z) ---
+        sm = np.asarray(debug["support_mask"], dtype=bool)
+        sg = np.asarray(debug["support_gate"], dtype=np.float64)
+        vec_leg("support_preload_delta_z", debug["support_preload_delta_z"])
+        vec_leg("support_push_z", debug["support_preload_delta_z"])  # fast trot 中 = support_preload_delta_z
+        s("global_support_height_offset_m", debug.get("global_support_height_offset_m", 0.0))
+        vec_leg("support_gate", sg)
+        if sm[0] and sm[3]:
+            actual_support_pair = "FR+RL"
+        elif sm[1] and sm[2]:
+            actual_support_pair = "FL+RR"
+        else:
+            legs = [POLICY_LEG_ORDER[i] for i in range(4) if sm[i]]
+            actual_support_pair = "+".join(legs) if legs else "none"
+        main_support_leg = POLICY_LEG_ORDER[int(np.argmax(sg))] if float(np.max(sg)) > 0.0 else "none"
+        s("actual_support_pair", actual_support_pair)
+        s("main_support_leg", main_support_leg)
 
         # --- bridge ---
         s("bridge_enabled", int(self.bridge.enabled))
@@ -851,6 +943,11 @@ class FanfanV4MigrationNode(Node):
         s("rear_early_contact_score_RL", float(early_score[rl]))
         s("rear_touchdown_kp_ramp_weight_RR", float(td_ramp[rr]))
         s("rear_touchdown_kp_ramp_weight_RL", float(td_ramp[rl]))
+
+        # --- 输出链路中间状态 (issue 2: 对齐 q_cmd_final) ---
+        vec_joint("q_last_cmd_sim", debug["q_last_cmd_sim"])
+        vec_joint("q_rate_limited_sim", debug["q_rate_limited_sim"])
+        vec_joint("q_torque_filtered_sim", debug["q_torque_filtered_sim"])
 
         # --- gains / safety (kp/kd 是增益幅值, sim==real_policy) ---
         vec_joint("kp", debug["kp_sim"])

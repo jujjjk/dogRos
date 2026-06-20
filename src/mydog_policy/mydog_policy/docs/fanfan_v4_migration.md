@@ -180,6 +180,21 @@ dry-run（`dry_run_virtual_feedback=true`）下 IMU 视为水平、base_height=t
 
 ---
 
+## 4.1 sim_compare = golden 输入回放（验证数学等价）
+
+`test_mode=sim_compare` 且加载了 golden CSV 时，wrapper **把 golden 行里的 base 状态 / q_actual / dq / foot force 喂回 core**，
+即“相同输入下检验迁移数学是否等价”，**不改 gait / VMC / 滤波数学**：
+
+- `q_ref` 的 support/stance foot z 差异（约 5mm）来自 **Light VMC**：golden 有真实 base height/roll/pitch，dry-run 没有。
+  喂入 golden base 状态后，core 复算出同样的 `vmc_foot_z_offset`（实测喂 pitch=0.05/height=0.300 → z offset ≈ 5.3mm），`q_ref` 即对齐。
+- `q_cmd_final` 差异来自 **torque backoff 的 q_current / qd_current**：
+  - 修正 1：core 的 PD 力矩补回了仿真的阻尼项 `tau = kp·(q_target−q_current) − kd·qd_current`（之前漏了 `−kd·qd`）。
+  - 修正 2：sim_compare 喂入 golden 的 `q_actual`（作 q_current）和有限差分 `dq`（作 qd_current），backoff 即复刻 golden。
+- off-by-one：sim 在 step *t* 用的是“上一步物理后”的状态（golden row *t−1*）算 `q_cmd[t]`，
+  所以 INPUT 取 `rel−dt` 处的 golden 行，输出再对齐 `rel` 处。
+
+> 真机 (air/touch/...) 仍用真实反馈；sim_compare 的回放只为验证数学端口正确。
+
 ## 5. 输出流水线（与仿真一致）
 
 ```
